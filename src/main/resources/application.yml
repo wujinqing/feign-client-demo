@@ -4,6 +4,26 @@ feign:
   client:
     config:
       default:
-        connectTimeout: 5000
-        readTimeout: 5000
-        loggerLevel: basic
+#        connectTimeout: 50000
+#        readTimeout: 50000
+        loggerLevel: full
+        requestInterceptors: com.jin.feign.client.demo.interceptor.MyRequestInterceptor2,com.jin.feign.client.demo.interceptor.MyRequestInterceptor3
+      MyFeignClient2:
+#        connectTimeout: 6000
+#        readTimeout: 6000
+         loggerLevel: full
+
+
+
+ribbon:
+  ReadTimeout: 4000
+  ConnectTimeout: 4000
+
+MyFeignClient2:
+  ribbon:
+    ReadTimeout: 3000
+    ConnectTimeout: 1000
+    MaxAutoRetries: 0
+    MaxAutoRetriesNextServer: 1
+    listOfServers: http://localhost:8080,http://localhost:8082,http://localhost:8083
+#    NFLoadBalancerRuleClassName: com.netflix.loadbalancer.WeightedResponseTimeRule

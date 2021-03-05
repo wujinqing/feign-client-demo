@@ -10,8 +10,331 @@
 
 > 5.真实的底层网络请求是在SynchronousMethodHandler的invoke()方法中完成的。
 
+## Feign初始化流程
+
+> 1.在启动类上加上@EnableFeignClients注解。
+
+> 2.在@EnableFeignClients注解里面通过@Import(FeignClientsRegistrar.class)导入FeignClientsRegistrar这个bean定义注册器。
+
+> 3.在FeignClientsRegistrar类中会扫描所有被@FeignClient注解修饰的类，并把每一个自定义的被@FeignClient注解修饰的接口封装成一个对应的FeignClientFactoryBean实例的bean定义。
+
+> 4.通过FeignClientFactoryBean的getObject()方法生成对应的自定义的MyFeignClient代理实例。
+
+## FeignClientFactoryBean生成自定义FeignClient代理实例流程
+
+> 1.扫描所有被@FeignClient注解修饰的类或者接口，将对应的类或者接口的信息以及@FeignClient注解的信息封装成一个FeignClientFactoryBean对象。
+
+> 2.通过getObject()方法生成对应的自定义的MyFeignClient代理实例。
+
+## FeignClientFactoryBean的getObject()方法执行逻辑剖析
+> 1.通过applicationContext获取FeignAutoConfiguration里面自动配置的FeignContext上下文对象。
+
+> 2.为当前的FeignClient创建一个独立上下文对象(AnnotationConfigApplicationContext)。
+
+> 3.将@FeignClient注解里面的configuration(数组)配置里面的class对象里面的配置注册到当前FeignClient上下文当中。
+
+> 4.将@EnableFeignClients注解里面的defaultConfiguration(数组)配置里面的class对象里面的配置注册到当前FeignClient上下文当中。
+
+> 5.将FeignClientsConfiguration对象里面的配置注册到当前FeignClient上下文当中。
+
+> 6.从FeignClient上下文当中获取到Encoder.class，Decoder.class，Contract.class，FeignLoggerFactory.class实例存放在Feign.Builder中用来构建FeignClient代理实例。
+
+> 7.使用FeignClient上下文的bean容器里面的类配置, 从@FeignClient注解里面的configuration(数组)配置，FeignClientsConfiguration对象里面的配置；来设置Feign.Builder。
+
+> 8.使用FeignClientProperties指定的全局默认配置(名字为default的配置)；来设置Feign.Builder。
+
+> 9.使用FeignClientProperties指定的特定于当前FeignClient配置；来设置Feign.Builder。
+
+> 10.从FeignClient上下文的bean容器里面获取Targeter对象，调用它的target()方法生成FeignClient代理实例。
+
+## Targeter生成FeignClient代理实例流程
+
+> 1.Targeter的target()方法会调用Feign.Builder.target()。
+
+> 2.调用build()方法生成ReflectiveFeign对象。
+> 
+> 3.调用newInstance()方法，使用JDK的动态代理生成FeignClient代理实例(被@FeignClient注解修饰的类必须是接口，不然无法使用JDK的动态代理)。
+
+## newInstance()方法剖析
+> 1.通过Contract解析自定义@FeignClient接口里面的每一个方法，解析成一个个SynchronousMethodHandler对象.
+
+> 2.创建JDK动态代理的调用处理器实例，类型是ReflectiveFeign.FeignInvocationHandler。
+
+> 3.通过JDK动态代理使用自定义@FeignClient注解修饰的接口和和上面创建的InvocationHandler创建代理实例并返回(即实现了MyFeignClient接口的类，我们通过spring容器自动注入的MyFeignClient对象就是这个代理类)。
 
 
+### RequestInterceptor拦截器执行
+> 拦截器在这个方法中执行feign.SynchronousMethodHandler.targetRequest()。
+
+```
+Request targetRequest(RequestTemplate template) {
+    for (RequestInterceptor interceptor : requestInterceptors) {
+      interceptor.apply(template);
+    }
+    return target.apply(template);
+  }
+```
+### 所有对MyFeignClient接口里面的方法的调用都会代理到ReflectiveFeign.FeignInvocationHandler.invoke()方法中执行。
+```
+@Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      if ("equals".equals(method.getName())) {
+        try {
+          Object otherHandler =
+              args.length > 0 && args[0] != null ? Proxy.getInvocationHandler(args[0]) : null;
+          return equals(otherHandler);
+        } catch (IllegalArgumentException e) {
+          return false;
+        }
+      } else if ("hashCode".equals(method.getName())) {
+        return hashCode();
+      } else if ("toString".equals(method.getName())) {
+        return toString();
+      }
+
+      return dispatch.get(method).invoke(args);
+    }
+```
+
+### 所有对MyFeignClient接口里面的方法的调用最终会调用SynchronousMethodHandler.invoke()方法。
+```
+
+public Object invoke(Object[] argv) throws Throwable {
+    RequestTemplate template = buildTemplateFromArgs.create(argv);
+    Retryer retryer = this.retryer.clone();
+    while (true) {
+      try {
+        return executeAndDecode(template);
+      } catch (RetryableException e) {
+        try {
+          retryer.continueOrPropagate(e);
+        } catch (RetryableException th) {
+          Throwable cause = th.getCause();
+          if (propagationPolicy == UNWRAP && cause != null) {
+            throw cause;
+          } else {
+            throw th;
+          }
+        }
+        if (logLevel != Logger.Level.NONE) {
+          logger.logRetry(metadata.configKey(), logLevel);
+        }
+        continue;
+      }
+    }
+  }
+```
+### 通过JDK动态代理生成代理类
+```
+public <T> T newInstance(Target<T> target) {
+    // key:MyFeignClient#timeout(Long), value: SynchronousMethodHandler
+    Map<String, MethodHandler> nameToHandler = targetToHandlersByName.apply(target);
+    Map<Method, MethodHandler> methodToHandler = new LinkedHashMap<Method, MethodHandler>();
+    List<DefaultMethodHandler> defaultMethodHandlers = new LinkedList<DefaultMethodHandler>();
+
+    for (Method method : target.type().getMethods()) {
+      if (method.getDeclaringClass() == Object.class) {
+        continue;
+      } else if (Util.isDefault(method)) {
+        DefaultMethodHandler handler = new DefaultMethodHandler(method);
+        defaultMethodHandlers.add(handler);
+        methodToHandler.put(method, handler);
+      } else {
+        methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
+      }
+    }
+    // 创建调用处理器
+    InvocationHandler handler = factory.create(target, methodToHandler);
+    // 通过JDK动态代理生成代理类
+    T proxy = (T) Proxy.newProxyInstance(target.type().getClassLoader(),
+        new Class<?>[] {target.type()}, handler);
+
+    for (DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
+      defaultMethodHandler.bindTo(proxy);
+    }
+    return proxy;
+  }
+```
+
+### 生成ReflectiveFeign对象
+```
+public <T> T target(Target<T> target) {
+      return build().newInstance(target);
+    }
+
+    public Feign build() {
+      SynchronousMethodHandler.Factory synchronousMethodHandlerFactory =
+          new SynchronousMethodHandler.Factory(client, retryer, requestInterceptors, logger,
+              logLevel, decode404, closeAfterDecode, propagationPolicy);
+      ParseHandlersByName handlersByName =
+          new ParseHandlersByName(contract, options, encoder, decoder, queryMapEncoder,
+              errorDecoder, synchronousMethodHandlerFactory);
+      return new ReflectiveFeign(handlersByName, invocationHandlerFactory, queryMapEncoder);
+    }
+```
+### 从三个地方配置Feign.Builder
+
+```
+protected void configureFeign(FeignContext context, Feign.Builder builder) {
+		FeignClientProperties properties = this.applicationContext
+				.getBean(FeignClientProperties.class);
+		if (properties != null) {
+			if (properties.isDefaultToProperties()) {
+			   // 使用FeignClient上下文的bean容器里面的类配置, 从@FeignClient注解里面的configuration(数组)配置，FeignClientsConfiguration对象里面的配置。
+				configureUsingConfiguration(context, builder);
+				// 使用FeignClientProperties指定的全局默认配置(名字为default的配置)
+				configureUsingProperties(
+						properties.getConfig().get(properties.getDefaultConfig()),
+						builder);
+				// 使用FeignClientProperties指定的特定于当前FeignClient配置		
+				configureUsingProperties(properties.getConfig().get(this.contextId),
+						builder);
+			}
+			else {
+				configureUsingProperties(
+						properties.getConfig().get(properties.getDefaultConfig()),
+						builder);
+				configureUsingProperties(properties.getConfig().get(this.contextId),
+						builder);
+				configureUsingConfiguration(context, builder);
+			}
+		}
+		else {
+			configureUsingConfiguration(context, builder);
+		}
+	}
+	
+	
+	protected void configureUsingProperties(
+			FeignClientProperties.FeignClientConfiguration config,
+			Feign.Builder builder) {
+		if (config == null) {
+			return;
+		}
+
+		if (config.getLoggerLevel() != null) {
+			builder.logLevel(config.getLoggerLevel());
+		}
+
+       // ConnectTimeout和ReadTimeout要同时设置才会生效
+		if (config.getConnectTimeout() != null && config.getReadTimeout() != null) {
+			builder.options(new Request.Options(config.getConnectTimeout(),
+					config.getReadTimeout()));
+		}
+
+		if (config.getRetryer() != null) {
+			Retryer retryer = getOrInstantiate(config.getRetryer());
+			builder.retryer(retryer);
+		}
+
+		if (config.getErrorDecoder() != null) {
+			ErrorDecoder errorDecoder = getOrInstantiate(config.getErrorDecoder());
+			builder.errorDecoder(errorDecoder);
+		}
+
+		if (config.getRequestInterceptors() != null
+				&& !config.getRequestInterceptors().isEmpty()) {
+			// this will add request interceptor to builder, not replace existing
+			for (Class<RequestInterceptor> bean : config.getRequestInterceptors()) {
+				RequestInterceptor interceptor = getOrInstantiate(bean);
+				builder.requestInterceptor(interceptor);
+			}
+		}
+
+		if (config.getDecode404() != null) {
+			if (config.getDecode404()) {
+				builder.decode404();
+			}
+		}
+
+		if (Objects.nonNull(config.getEncoder())) {
+			builder.encoder(getOrInstantiate(config.getEncoder()));
+		}
+
+		if (Objects.nonNull(config.getDecoder())) {
+			builder.decoder(getOrInstantiate(config.getDecoder()));
+		}
+
+		if (Objects.nonNull(config.getContract())) {
+			builder.contract(getOrInstantiate(config.getContract()));
+		}
+	}
+```
+### 从FeignClient上下文当中获取到Encoder.class，Decoder.class，Contract.class，FeignLoggerFactory.class实例存放在Feign.Builder中用来构建FeignClient代理实例。
+
+```
+protected Feign.Builder feign(FeignContext context) {
+		FeignLoggerFactory loggerFactory = get(context, FeignLoggerFactory.class);
+		Logger logger = loggerFactory.create(this.type);
+
+		// @formatter:off
+		Feign.Builder builder = get(context, Feign.Builder.class)
+				// required values
+				.logger(logger)
+				.encoder(get(context, Encoder.class))
+				.decoder(get(context, Decoder.class))
+				.contract(get(context, Contract.class));
+		// @formatter:on
+
+		configureFeign(context, builder);
+
+		return builder;
+	}
+```
+
+### 为每一个FeignClient创建一个独立上下文对象
+``` 
+protected AnnotationConfigApplicationContext getContext(String name) {
+		if (!this.contexts.containsKey(name)) {
+			synchronized (this.contexts) {
+				if (!this.contexts.containsKey(name)) {
+					this.contexts.put(name, createContext(name));
+				}
+			}
+		}
+		return this.contexts.get(name);
+	}
+
+	protected AnnotationConfigApplicationContext createContext(String name) {
+		AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext();
+		if (this.configurations.containsKey(name)) {
+		   // 将@FeignClient注解里面的configuration(数组)配置里面的class对象里面的配置注册到当前FeignClient上下文当中。
+			for (Class<?> configuration : this.configurations.get(name)
+					.getConfiguration()) {
+				context.register(configuration);
+			}
+		}
+		
+		
+		for (Map.Entry<String, C> entry : this.configurations.entrySet()) {
+		
+		    // 将@EnableFeignClients注解里面的defaultConfiguration(数组)配置里面的class对象里面的配置注册到当前FeignClient上下文当中。
+			if (entry.getKey().startsWith("default.")) {
+				for (Class<?> configuration : entry.getValue().getConfiguration()) {
+					context.register(configuration);
+				}
+			}
+		}
+		
+		// 将FeignClientsConfiguration对象里面的配置注册到当前FeignClient上下文当中。
+		context.register(PropertyPlaceholderAutoConfiguration.class,
+				this.defaultConfigType);
+		context.getEnvironment().getPropertySources().addFirst(new MapPropertySource(
+				this.propertySourceName,
+				Collections.<String, Object>singletonMap(this.propertyName, name)));
+		if (this.parent != null) {
+			// Uses Environment from parent as well as beans
+			context.setParent(this.parent);
+			// jdk11 issue
+			// https://github.com/spring-cloud/spring-cloud-netflix/issues/3101
+			context.setClassLoader(this.parent.getClassLoader());
+		}
+		context.setDisplayName(generateDisplayName(name));
+		context.refresh();
+		return context;
+	}
+
+```
 ## MyFeignClient的代理对象初始化过程
 
 ### 通过org.springframework.cloud.openfeign.FeignClientFactoryBean的getTarget()构建Targeter
@@ -363,448 +686,73 @@ Object decode(Response response) throws Throwable {
 ```
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+### 被@FeignClient注解修饰的类必须是接口
+
+```
+org.springframework.cloud.openfeign.FeignClientsRegistrar.registerFeignClients
+
+public void registerFeignClients(AnnotationMetadata metadata,
+			BeanDefinitionRegistry registry) {
+		ClassPathScanningCandidateComponentProvider scanner = getScanner();
+		scanner.setResourceLoader(this.resourceLoader);
+
+		Set<String> basePackages;
+
+		Map<String, Object> attrs = metadata
+				.getAnnotationAttributes(EnableFeignClients.class.getName());
+		AnnotationTypeFilter annotationTypeFilter = new AnnotationTypeFilter(
+				FeignClient.class);
+		final Class<?>[] clients = attrs == null ? null
+				: (Class<?>[]) attrs.get("clients");
+		if (clients == null || clients.length == 0) {
+			scanner.addIncludeFilter(annotationTypeFilter);
+			basePackages = getBasePackages(metadata);
+		}
+		else {
+			final Set<String> clientClasses = new HashSet<>();
+			basePackages = new HashSet<>();
+			for (Class<?> clazz : clients) {
+				basePackages.add(ClassUtils.getPackageName(clazz));
+				clientClasses.add(clazz.getCanonicalName());
+			}
+			AbstractClassTestingTypeFilter filter = new AbstractClassTestingTypeFilter() {
+				@Override
+				protected boolean match(ClassMetadata metadata) {
+					String cleaned = metadata.getClassName().replaceAll("\\$", ".");
+					return clientClasses.contains(cleaned);
+				}
+			};
+			scanner.addIncludeFilter(
+					new AllTypeFilter(Arrays.asList(filter, annotationTypeFilter)));
+		}
+
+		for (String basePackage : basePackages) {
+			Set<BeanDefinition> candidateComponents = scanner
+					.findCandidateComponents(basePackage);
+			for (BeanDefinition candidateComponent : candidateComponents) {
+				if (candidateComponent instanceof AnnotatedBeanDefinition) {
+					// verify annotated class is an interface
+					AnnotatedBeanDefinition beanDefinition = (AnnotatedBeanDefinition) candidateComponent;
+					AnnotationMetadata annotationMetadata = beanDefinition.getMetadata();
+					// 验证被@FeignClient注解修饰的类必须是接口
+					Assert.isTrue(annotationMetadata.isInterface(),
+							"@FeignClient can only be specified on an interface");
+
+					Map<String, Object> attributes = annotationMetadata
+							.getAnnotationAttributes(
+									FeignClient.class.getCanonicalName());
+
+					String name = getClientName(attributes);
+					registerClientConfiguration(registry, name,
+							attributes.get("configuration"));
+
+					registerFeignClient(registry, annotationMetadata, attributes);
+				}
+			}
+		}
+	}
+
+```
 
 
 
